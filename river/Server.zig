@@ -98,6 +98,8 @@ lock_manager: LockManager,
 xwayland: if (build_options.xwayland) ?*wlr.Xwayland else void = if (build_options.xwayland) null,
 new_xwayland_surface: if (build_options.xwayland) wl.Listener(*wlr.XwaylandSurface) else void =
     if (build_options.xwayland) wl.Listener(*wlr.XwaylandSurface).init(handleNewXwaylandSurface),
+xwayland_ready: if (build_options.xwayland) wl.Listener(void) else void =
+    if (build_options.xwayland) wl.Listener(void).init(handleXwaylandReady),
 
 renderer_lost: wl.Listener(void) = wl.Listener(void).init(handleRendererLost),
 
@@ -187,6 +189,7 @@ pub fn init(server: *Server, runtime_xwayland: bool) !void {
     if (build_options.xwayland and runtime_xwayland) {
         server.xwayland = try wlr.Xwayland.create(wl_server, compositor, false);
         server.xwayland.?.events.new_surface.add(&server.new_xwayland_surface);
+        server.xwayland.?.events.ready.add(&server.xwayland_ready);
     }
 
     try server.root.init();
@@ -447,6 +450,49 @@ fn handleNewLayerSurface(listener: *wl.Listener(*wlr.LayerSurfaceV1), wlr_layer_
         wlr_layer_surface.resource.postNoMemory();
         return;
     };
+}
+
+// Set XWayland Global Scale
+//
+// This is done by connecting to the XWayland server over socket, and
+// sending a property change update for global output scale
+//
+// Both xserver's xwayland binary, as well as wlroots, must be patched to support this.
+// - https://gitlab.freedesktop.org/lilydjwg/wlroots/-/commit/c4ddb89686d84f8250b66a28471c5cb6e085e855
+// - https://gitlab.freedesktop.org/xorg/xserver/-/merge_requests/733
+fn setXwaylandScale(server: *Server) void {
+    const xcb_conn = c.xcb_connect(server.xwayland.?.display_name, null);
+    defer c.xcb_disconnect(xcb_conn);
+
+    var scale: u32 = 1;
+    if (server.input_manager.defaultSeat().focused_output) |output| {
+        scale = @intFromFloat(output.wlr_output.scale);
+    }
+
+    const atom_name = "_XWAYLAND_GLOBAL_OUTPUT_SCALE";
+    const atom_cookie = c.xcb_intern_atom(xcb_conn, 1, atom_name.len, atom_name);
+    const atom_reply = c.xcb_intern_atom_reply(xcb_conn, atom_cookie, null);
+
+    if (atom_reply == null) {
+        log.warn("no {s} atom, xwayland output scaling not supported", .{atom_name});
+    } else {
+        const screen = c.xcb_setup_roots_iterator(c.xcb_get_setup(xcb_conn)).data;
+        const atom_id = atom_reply.*.atom;
+        const window_id = screen.*.root;
+
+        log.debug("setting xwayland scale atom `{}` to `{}` on root window `{}`", .{ atom_id, scale, window_id });
+        const err_cookie = c.xcb_change_property_checked(xcb_conn, c.XCB_PROP_MODE_REPLACE, window_id, atom_id, c.XCB_ATOM_CARDINAL, 32, 1, &scale);
+        const err = c.xcb_request_check(xcb_conn, err_cookie);
+        if (err != null) {
+            log.warn("unable to set xwayland scale atom: {}", .{err.*.error_code});
+        }
+        _ = c.xcb_flush(xcb_conn);
+    }
+}
+
+fn handleXwaylandReady(listener: *wl.Listener(void)) void {
+    const server: *Server = @fieldParentPtr("xwayland_ready", listener);
+    server.setXwaylandScale();
 }
 
 fn handleNewXwaylandSurface(_: *wl.Listener(*wlr.XwaylandSurface), xwayland_surface: *wlr.XwaylandSurface) void {

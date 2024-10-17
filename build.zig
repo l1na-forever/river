@@ -168,6 +168,7 @@ pub fn build(b: *Build) !void {
         river.linkLibC();
         river.linkSystemLibrary("libevdev");
         river.linkSystemLibrary("libinput");
+        river.linkSystemLibrary("xcb");
         river.linkSystemLibrary("wayland-server");
         river.linkSystemLibrary("wlroots-0.18");
         river.linkSystemLibrary("xkbcommon");
